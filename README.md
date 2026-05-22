@@ -1,222 +1,172 @@
-🏬 Retail Data Warehouse ETL Pipeline (Oracle + Airflow) 📌 Project Overview
+# Retail Data Warehouse ETL Pipeline
 
-This project implements a production-style Retail Data Warehouse ETL pipeline using Oracle Database, Python, and Apache Airflow.
+A production-grade ETL pipeline that extracts transactional retail data from an Oracle OLTP source, validates it at every stage, and loads it into a clean star-schema data warehouse ready for analytics and reporting.
 
-The goal is to:
+---
 
-Extract transactional retail data from an Oracle source system
+## What This Project Does
 
-Validate data quality at every stage
+Most raw retail data sits in transactional systems optimized for writes, not analysis. This pipeline bridges that gap — it pulls daily snapshots of sales, store, product, and distributor data, validates it rigorously, transforms it into a dimensional model, and loads it into a structured Oracle data warehouse that analysts can actually query.
 
-Transform raw business attributes into surrogate-key–based dimensions
+The result is a re-runnable, auditable pipeline that mirrors how real enterprise data engineering teams operate.
 
-Load clean, analytics-ready data into a Target Data Warehouse (DW)
+---
 
-This project follows real-world Data Engineering best practices, including incremental loads, data validation, orchestration, and schema separation.
+## Architecture
 
-🏗️ Architecture Overview Oracle OLTP (Source) | v Daily Extraction (CSV Snapshots) | v Data Validation (Files + Tables) | v Transformation (Set-based Logic) | v Oracle Target Data Warehouse (Star Schema) | v Analytics / Reporting
+```
+Oracle OLTP (Source)
+        |
+Daily CSV Snapshots  (pipe-delimited, timestamped)
+        |
+Data Validation      (file-level + table-level checks)
+        |
+Dimensional Transform (surrogate keys, incremental loads)
+        |
+Oracle Target DW     (star schema)
+        |
+Analytics / Reporting
+```
 
-🧱 Data Layers Explained 1️⃣ Source Layer (Oracle – OLTP)
+---
 
-Tables like:
+## Data Layers
 
-fact_sales
+**Source Layer** — Read-only Oracle OLTP tables: `fact_sales`, `dim_store_master`, `dim_product`, `dim_distributor`, `dim_date`. Nothing is modified here.
 
-dim_store_master
+**Extract Layer** — SQL joins produce daily pipe-delimited CSV snapshots stored under:
 
-dim_product
+```
+/opt/airflow/data_extracts/
+    incoming/   sales_snapshot_YYYYMMDD_HHMM.csv
+    current/
+    archive/
+```
 
-dim_distributor
+Files decouple the source from the warehouse and make reprocessing straightforward.
 
-dim_date
+**Validation Layer** — Two levels of checks run before any data reaches the warehouse:
 
-Data is read-only
+- File validation: required columns, numeric types, Y/N flag values, minimum row count, delimiter integrity
+- Table validation: row count thresholds, NULL checks on critical columns, duplicate primary key detection, fact table freshness
 
-No transformations happen here
+If any check fails, the pipeline stops immediately. No partial or silently corrupt loads.
 
-2️⃣ Extract Layer (Files)
+**Target Data Warehouse** — A star schema under the `target_dw` schema in Oracle:
 
-Daily snapshot files are generated using SQL joins and stored as pipe-delimited CSVs:
+| Dimensions | Fact |
+|---|---|
+| `dim_store_dw` | `fact_sales_dw` |
+| `dim_store_chain_dw` | |
+| `dim_product_dw` | |
+| `dim_category` | |
+| `dim_sub_category` | |
+| `dim_manufacturer` | |
+| `dim_distributor_dw` | |
+| `dim_date_dw` | |
 
-/opt/airflow/data_extracts/ 
-            ├── incoming/ 
-            │ └── sales_snapshot_YYYYMMDD_HHMM.csv 
-            ├── current/ 
-            ├── archive/
+---
 
-Why files?
+## How Dimensions Are Loaded
 
-Decouples source from warehouse
+Each dimension follows a set-based incremental load pattern:
 
-Allows reprocessing
+1. Read the latest incoming file
+2. Extract unique business keys
+3. Pull existing keys from the DW into an in-memory cache
+4. Identify only new records
+5. Insert new records, update the cache
+6. Map surrogate keys back to the working dataset
 
-Mimics real enterprise pipelines
+This avoids full-table reloads on every run and scales cleanly as data volumes grow.
 
-3️⃣ Validation Layer (Data Quality)
+---
 
-Validation is applied at two levels:
+## Manufacturer Enrichment
 
-🔹 File Validation
+Manufacturers are derived from product category using controlled mappings, mimicking real master data enrichment:
 
-Mandatory column checks
+| Category | Mapped Manufacturers |
+|---|---|
+| Grocery | Nestle, Tata Consumer, Britannia |
+| BabyCare | Johnson & Johnson, P&G |
+| PersonalCare | HUL, Dabur |
 
-Numeric column validation
+---
 
-Flag column validation (Y/N)
+## Orchestration
 
-Minimum row count
+Three Airflow DAGs run in sequence:
 
-Pipe (|) delimiter handling
+**Extraction DAG** — Generates daily snapshot files from the source system.
 
-🔹 Table Validation
+**Validation DAG** — Validates extracted files and source tables before any transformation begins.
 
-Row count thresholds
+**Target DW Load DAG** — Loads dimensions and facts in dependency order:
 
-NULL checks on critical columns
+```
+load_dim_store_dw
+    >> load_dim_product_dw
+    >> load_dim_distributor_dw
+    >> load_dim_date_dw
+    >> load_fact_sales_dw
+```
 
-Duplicate primary key checks
+All tasks have retry logic enabled. Failures are loud and logged clearly — nothing fails silently.
 
-Freshness check for fact tables
+---
 
-If validation fails → pipeline stops immediately.
+## Tech Stack
 
-4️⃣ Target Data Warehouse (Oracle – DW)
+| Component | Tool |
+|---|---|
+| Database | Oracle |
+| Orchestration | Apache Airflow |
+| Language | Python |
+| Libraries | pandas, oracledb |
+| Containerization | Docker |
+| Scheduling | Cron via Airflow |
 
-A Star Schema is implemented under a separate schema (target_dw).
+---
 
-Dimension Tables
+## Running the Project
 
-dim_store_dw
+**Start Airflow**
+```bash
+docker-compose up -d
+```
 
-dim_store_chain_dw
+**Verify containers are running**
+```bash
+docker ps
+```
 
-dim_product_dw
+**Open the Airflow UI**
+```
+http://localhost:8080
+```
 
-dim_category
+**Trigger DAGs in order**
+1. Extraction pipeline
+2. Validation pipeline
+3. Target DW load pipeline
 
-dim_sub_category
+---
 
-dim_manufacturer
+## Error Handling
 
-dim_distributor_dw
+The pipeline handles these failure modes explicitly:
 
-dim_date_dw
+- Invalid numeric values (`DPY-4004`)
+- Empty or malformed files
+- Missing foreign keys
+- Duplicate business keys
+- Partial data loads
 
-Fact Table
+Every failure produces clear logs. The pipeline is designed to be re-run safely after any fix.
 
-fact_sales_dw
+---
 
-Key Concepts Used
+## Outcome
 
-Surrogate keys
-
-Business keys
-
-Foreign key constraints
-
-Incremental dimension loads
-
-🔄 Incremental Dimension Load Logic (Set-Based)
-
-Each dimension follows this pattern:
-
-Read latest incoming file
-
-Extract unique business keys
-
-Fetch existing keys from DW into a dictionary (cache)
-
-Identify new records only
-
-Insert only new records
-
-Update cache
-
-Map surrogate keys back to main dataset
-
-This approach is:
-
-Fast
-
-Scalable
-
-Industry standard
-
-🧪 Manufacturer & Category Handling
-
-Manufacturers are derived logically based on product category using controlled mappings.
-
-Example:
-
-Grocery → Nestlé, Tata Consumer, Britannia
-
-BabyCare → Johnson & Johnson, P&G
-
-PersonalCare → HUL, Dabur
-
-This mimics real master data enrichment.
-
-⏱️ Orchestration (Apache Airflow) Key DAGs 🔹 Extraction DAG
-
-Generates daily snapshot files
-
-🔹 Validation DAG
-
-Validates extracted files
-
-Validates source tables
-
-🔹 Target DW Load DAG load_dim_store_dw >> load_dim_product_dw >> load_dim_distributor_dw >> load_dim_date_dw >> load_fact_sales_dw
-
-Retry logic enabled
-
-Fail-fast on data issues
-
-Fully automated (no manual runs required)
-
-📦 Technologies Used 
-Category | Tools 
-Database | Oracle Database
-Orchestration | Apache Airflow
-Language | Python 
-Libraries | pandas, oracledb 
-Containerization | Docker 
-Scheduling Cron via Airflow 
-▶️ How to Run the Project 
-1️⃣ Start Airflow docker-compose up -d
-
-2️⃣ Verify Containers docker ps
-
-3️⃣ Open Airflow UI http://localhost:8080
-
-4️⃣ Trigger DAGs (in order)
-
-Extract pipeline
-
-Validation pipeline
-
-Target DW load pipeline
-
-🛡️ Error Handling
-
-Common issues handled:
-
-Invalid numeric values (DPY-4004)
-
-Empty or malformed files
-
-Missing foreign keys
-
-Duplicate business keys
-
-Partial data loads
-
-Pipelines fail safely with clear logs.
-
-📊 Outcome
-
-After completion: Clean star-schema data in Oracle DW
-
-Fully validated, analytics-ready tables
-
-Re-runnable, auditable pipeline
+After a successful run you get a fully populated star schema in Oracle with clean, validated, surrogate-key-based tables that are ready for BI tools or SQL-based analysis — with a complete audit trail of every load.
